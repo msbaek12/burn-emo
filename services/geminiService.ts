@@ -18,64 +18,71 @@ const SYSTEM_INSTRUCTION = `
 [공감 및 인정] -> [위로의 한마디] -> [소각 암시]
 `;
 
-// 간단한 지수 백오프 재시도 로직
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 export const getGeminiResponse = async (userMessage: string, retryCount = 0): Promise<string> => {
   try {
-    const apiKey = process.env.API_KEY;
+    // API 키 공백 제거 및 확인
+    const apiKey = (process.env.API_KEY || "").trim();
     if (!apiKey) throw new Error("MISSING_API_KEY");
 
-    // 매 요청마다 새로운 클라이언트를 생성하는 것이 stateless 환경(Vercel 등)에서 더 안전합니다.
     const ai = new GoogleGenAI({ apiKey });
 
-    // ChatSession 대신 generateContent를 사용합니다.
-    // 감정 소각장은 이전 대화를 기억할 필요가 없으며(이미 태웠으므로),
-    // 기억을 못 하는 것이 컨셉에 더 맞고 오류도 적습니다.
     const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
-      contents: userMessage, // 단순 텍스트 혹은 content object
+      contents: userMessage,
       config: {
         systemInstruction: SYSTEM_INSTRUCTION,
-        temperature: 0.8, // 감성적인 표현을 위해 창의성 높임
-        // 안전 설정: 사용자가 부정적인 감정(욕설, 비관 등)을 쏟아낼 때 차단되지 않도록 완화
+        temperature: 0.9, // 공감 능력을 위해 창의성 높임
+        // 안전 설정: 감정 배설을 위해 모든 필터를 끕니다 (BLOCK_NONE)
+        // 주의: BLOCK_NONE을 사용해도 아동 안전 등 절대적인 기준은 걸릴 수 있습니다.
         safetySettings: [
-            { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_ONLY_HIGH },
-            { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_ONLY_HIGH },
-            { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_ONLY_HIGH },
-            { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_ONLY_HIGH },
+            { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+            { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+            { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+            { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
         ],
       },
     });
 
-    // 텍스트가 없으면(필터링됨) 대체 메시지 반환
-    const text = response.text;
-    if (!text) {
-        return "그 감정은 너무나 뜨거워서, 하얀 재만 남기고 순식간에 사라졌어요. (내용이 너무 격렬해서 말이 나오지 않았나 봐요.)";
+    // 1. 정상적으로 텍스트가 나온 경우
+    if (response.text) {
+        return response.text;
     }
 
-    return text;
+    // 2. 텍스트가 없으면 안전 필터(Safety) 혹은 기타 사유로 차단된 것
+    const candidate = response.candidates?.[0];
+    if (candidate?.finishReason === 'SAFETY') {
+        return "그 감정은 너무나 뜨겁고 강렬해서, 소각로의 안전 장치가 작동했어요. (내용이 너무 격해서 필터링되었습니다. 조금만 더 순화해서 태워주세요.)";
+    }
+
+    return "고민이 흔적도 없이 사라졌어요. (AI가 응답을 생성하지 못했습니다)";
 
   } catch (error: any) {
     console.error("Gemini API Error:", error);
 
-    // 503 (Server Overload) 에러 시 1회 재시도
-    if (error.status === 503 && retryCount < 1) {
-        console.log("Retrying request due to 503...");
-        await wait(1500);
+    // 429 에러 (Too Many Requests) - 1회 재시도
+    if ((error.status === 429 || error.status === 503) && retryCount < 1) {
+        await wait(2000);
         return getGeminiResponse(userMessage, retryCount + 1);
     }
 
-    // 에러 메시지 분기
-    if (error.message === "MISSING_API_KEY") {
-        return "관리자님, 소각로의 점화 플러그(API KEY)가 빠져있습니다. 설정 확인이 필요해요.";
+    // 사용자에게 보여줄 에러 메시지 가공
+    const errorMsg = error.toString();
+
+    if (errorMsg.includes("429")) {
+        return "소각장이 너무 붐비네요. 잠시 열기를 식히고 1분 뒤에 다시 와주세요. (사용량 초과)";
     }
 
-    // 안전 필터나 기타 이유로 블락된 경우
-    if (error.toString().includes("SAFETY") || error.toString().includes("blocked")) {
-        return "당신의 감정이 너무 강렬해서 소각로가 잠시 멈췄어요. 하지만 그 마음은 확실히 받았습니다.";
+    if (errorMsg.includes("API_KEY")) {
+        return "관리자에게 문의해주세요: API 키 설정에 문제가 있습니다.";
     }
 
-    return "연기가 너무 매워서 잠시 눈을 뜰 수가 없네요. 잠시 후 다시 태워주세요.";
+    if (errorMsg.includes("SAFETY")) {
+         return "감정이 너무 격렬해서 소각로가 잠시 멈췄어요. (안전 필터 차단)";
+    }
+
+    // 디버깅을 위해 실제 에러 메시지를 화면에 출력 (개발 단계)
+    return `시스템 오류가 발생했습니다: ${error.message || "알 수 없는 오류"}`;
   }
 };
