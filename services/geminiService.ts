@@ -20,69 +20,73 @@ const SYSTEM_INSTRUCTION = `
 
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-export const getGeminiResponse = async (userMessage: string, retryCount = 0): Promise<string> => {
+// 모델 호출 헬퍼 함수
+async function tryGenerate(ai: GoogleGenAI, modelName: string, prompt: string) {
+  return await ai.models.generateContent({
+    model: modelName,
+    contents: prompt,
+    config: {
+      systemInstruction: SYSTEM_INSTRUCTION,
+      temperature: 0.9,
+      safetySettings: [
+        { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+        { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+        { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+        { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+      ],
+    },
+  });
+}
+
+export const getGeminiResponse = async (userMessage: string): Promise<string> => {
+  const apiKey = (process.env.API_KEY || "").trim();
+  if (!apiKey) return "관리자에게 문의해주세요: API 키 설정이 비어있습니다.";
+
+  const ai = new GoogleGenAI({ apiKey });
+
   try {
-    // API 키 공백 제거 및 확인
-    const apiKey = (process.env.API_KEY || "").trim();
-    if (!apiKey) throw new Error("MISSING_API_KEY");
-
-    const ai = new GoogleGenAI({ apiKey });
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: userMessage,
-      config: {
-        systemInstruction: SYSTEM_INSTRUCTION,
-        temperature: 0.9, // 공감 능력을 위해 창의성 높임
-        // 안전 설정: 감정 배설을 위해 모든 필터를 끕니다 (BLOCK_NONE)
-        // 주의: BLOCK_NONE을 사용해도 아동 안전 등 절대적인 기준은 걸릴 수 있습니다.
-        safetySettings: [
-            { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-            { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
-            { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
-            { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-        ],
-      },
-    });
-
-    // 1. 정상적으로 텍스트가 나온 경우
-    if (response.text) {
-        return response.text;
+    // [1단계] 메인 모델 (Gemini 2.5 Flash) 시도
+    try {
+      const res = await tryGenerate(ai, 'gemini-2.5-flash', userMessage);
+      if (res.text) return res.text;
+    } catch (e: any) {
+      // 503(과부하)이나 429(요청 많음)가 아니면 진짜 에러이므로 던짐
+      if (e.status !== 503 && e.status !== 429) throw e;
+      console.warn("⚠️ Main model overloaded (503). Switching to Lite model...");
+      await wait(1000); // 1초 대기
     }
 
-    // 2. 텍스트가 없으면 안전 필터(Safety) 혹은 기타 사유로 차단된 것
-    const candidate = response.candidates?.[0];
-    if (candidate?.finishReason === 'SAFETY') {
-        return "그 감정은 너무나 뜨겁고 강렬해서, 소각로의 안전 장치가 작동했어요. (내용이 너무 격해서 필터링되었습니다. 조금만 더 순화해서 태워주세요.)";
+    // [2단계] 백업 모델 (Gemini Flash Lite) 시도
+    // Lite 모델은 더 가볍고 빠르며, 메인 모델과 쿼터가 다를 수 있어 성공 확률이 높음
+    try {
+      const res = await tryGenerate(ai, 'gemini-flash-lite-latest', userMessage);
+      if (res.text) return res.text;
+    } catch (e: any) {
+       if (e.status !== 503 && e.status !== 429) throw e;
+       console.warn("⚠️ Lite model also overloaded. Retrying Main model one last time...");
+       await wait(2000); // 2초 대기
     }
 
-    return "고민이 흔적도 없이 사라졌어요. (AI가 응답을 생성하지 못했습니다)";
+    // [3단계] 메인 모델 마지막 재시도
+    const res = await tryGenerate(ai, 'gemini-2.5-flash', userMessage);
+    
+    if (res.candidates?.[0]?.finishReason === 'SAFETY') {
+      return "그 감정은 너무나 뜨거워서 소각로의 안전 장치가 작동했어요. (내용이 너무 격해서 필터링되었습니다)";
+    }
+    
+    return res.text || "고민이 하얀 재가 되어 사라졌어요.";
 
   } catch (error: any) {
-    console.error("Gemini API Error:", error);
+    console.error("🔥 All retries failed:", error);
 
-    // 429 에러 (Too Many Requests) - 1회 재시도
-    if ((error.status === 429 || error.status === 503) && retryCount < 1) {
-        await wait(2000);
-        return getGeminiResponse(userMessage, retryCount + 1);
+    const msg = error.toString();
+    if (msg.includes("503") || msg.includes("overloaded")) {
+      return "지금 소각장에 사람들이 너무 많이 몰려있어요. 잠시만 기다렸다가 다시 태워주세요. (서버 과부하)";
     }
-
-    // 사용자에게 보여줄 에러 메시지 가공
-    const errorMsg = error.toString();
-
-    if (errorMsg.includes("429")) {
-        return "소각장이 너무 붐비네요. 잠시 열기를 식히고 1분 뒤에 다시 와주세요. (사용량 초과)";
+    if (msg.includes("429")) {
+      return "잠시만요, 소각로가 과열되었어요. 1분 정도 식힌 뒤에 다시 와주세요. (사용량 초과)";
     }
-
-    if (errorMsg.includes("API_KEY")) {
-        return "관리자에게 문의해주세요: API 키 설정에 문제가 있습니다.";
-    }
-
-    if (errorMsg.includes("SAFETY")) {
-         return "감정이 너무 격렬해서 소각로가 잠시 멈췄어요. (안전 필터 차단)";
-    }
-
-    // 디버깅을 위해 실제 에러 메시지를 화면에 출력 (개발 단계)
-    return `시스템 오류가 발생했습니다: ${error.message || "알 수 없는 오류"}`;
+    
+    return `시스템 오류가 발생했습니다. (${error.message || "Unknown Error"})`;
   }
 };
